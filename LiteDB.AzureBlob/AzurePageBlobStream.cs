@@ -16,54 +16,43 @@ namespace LiteDB.AzureBlob
     /// </summary>
     public class AzurePageBlobStream : Stream
     {
-        // configurations
-        public static bool WriteDebugLogs = false;
-        public static int PageSize = 1024 * 8;  // Default PageSize of LiteDB 5
-        public static int Pages = 8;
-        public static string DefaultContainerName = "litedbs";
-        public static long DefaultStreamSize = 1024 * 1024 * 1024; //1G
-        public static PremiumPageBlobTier DefaultBlobTier = PremiumPageBlobTier.P4;
+        private readonly CloudPageBlob _blog;
+        private readonly ConcurrentDictionary<long, byte[]> _cache = new ConcurrentDictionary<long, byte[]>();
+        private readonly object[] _locks = new object[Consts.NumberOfLocks];
+        private readonly ConcurrentDictionary<long, byte[]> _pendingWrites = new ConcurrentDictionary<long, byte[]>();
+        private readonly BlockingCollection<byte[]> _buffers = new BlockingCollection<byte[]>();
 
-        private const string MetadataLengthKey = "STREAM_LENGTH";
+        private long _lazyLength = 0;
+        private long? _length = null;
 
-        readonly CloudPageBlob Blob;
-        readonly ConcurrentDictionary<long, byte[]> Cache = new ConcurrentDictionary<long, byte[]>();
-        const int NumberOfLocks = 111;  // should be more than enough
-        readonly object[] Locks = new object[NumberOfLocks];
-        readonly ConcurrentDictionary<long, byte[]> Pending = new ConcurrentDictionary<long, byte[]>();
-        readonly BlockingCollection<byte[]> Buffers = new BlockingCollection<byte[]>();
-        long LazyLength = 0;
-
-        public AzurePageBlobStream(string connString, string databaseName)
+        public AzurePageBlobStream(string connectionString, string databaseName)
         {
-            CloudPageBlob blob = GetBlobReference(connString, databaseName);
-            if (!blob.ExistsAsync().Result)
+            var blob = GetBlobReference(connectionString, databaseName);
+
+            Task.Run(async () =>
             {
-                if (WriteDebugLogs)
-                    Console.WriteLine("Creating new page blob file " + databaseName);
-                blob.CreateAsync(DefaultStreamSize).Wait();
-                blob.SetPremiumBlobTierAsync(DefaultBlobTier).Wait();
-            }
-            Blob = blob;
+                if (!await blob.ExistsAsync())
+                {
+                    // Create database blob if it doesn't exist
+                    DebugLog("Creating new page blob file " + databaseName);
 
-            for (var i = 0; i < NumberOfLocks; i++)
-                Locks[i] = new object();
+                    await blob.CreateAsync(Consts.DefaultStreamSize);
+                    await blob.SetPremiumBlobTierAsync(Consts.DefaultBlobTier);
+                }
+            }).SyncWait();
+
+            _blog = blob;
+
+            // Initilize locks
+            for (var i = 0; i < Consts.NumberOfLocks; i++)
+                _locks[i] = new object();
+
+            // Initilize buffers
             for (var i = 0; i < Math.Max(Environment.ProcessorCount * 2, 10); i++)
-                Buffers.Add(new byte[PageSize * Pages]);
+                _buffers.Add(new byte[Consts.PageSize * Consts.Pages]);
+
             if (Length != 0)
-                ReadAhead(0);
-        }
-
-        private static CloudPageBlob GetBlobReference(string connString, string databaseName)
-        {
-            CloudStorageAccount.TryParse(connString, out var account);
-            var client = account.CreateCloudBlobClient();
-
-            var container = client.GetContainerReference(DefaultContainerName);
-            container.CreateIfNotExistsAsync().Wait();
-
-            var blob = container.GetPageBlobReference(databaseName);
-            return blob;
+                ReadAhead(0); // Read first block immediately
         }
 
         public override bool CanRead => true;
@@ -72,73 +61,60 @@ namespace LiteDB.AzureBlob
 
         public override bool CanWrite => true;
 
-        private void SetLengthInternal(long newLength)
-        {
-            _Length = newLength;
-            if (WriteDebugLogs)
-                Console.WriteLine($"SetLength = {newLength / PageSize}");
-            Blob.Metadata[MetadataLengthKey] = newLength.ToString();
-            Blob.SetMetadataAsync(); // .Wait();
-        }
+        public override long Position { get; set; }
 
-        long? _Length = null;
         public override long Length
         {
             get
             {
-                if (!_Length.HasValue)
+                if (!_length.HasValue)
                 {
-                    Blob.FetchAttributesAsync().Wait();
-                    if (!Blob.Metadata.TryGetValue(MetadataLengthKey, out string value) || !long.TryParse(value, out long realLength))
+                    _blog.FetchAttributesAsync().SyncWait();
+
+                    if (!_blog.Metadata.TryGetValue(Consts.MetadataLengthKey, out string value) || !long.TryParse(value, out long realLength))
                     {
                         SetLengthInternal(0);
-                        _Length = 0;
+                        _length = 0;
                         return 0;
                     }
-                    if (realLength % PageSize != 0)
-                        throw new NotImplementedException("file size is invalid!");
-                    if (WriteDebugLogs)
-                        Console.WriteLine($"GetLength = {realLength / PageSize}");
-                    _Length = realLength;
+
+                    if (realLength % Consts.PageSize != 0)
+                        throw new InvalidOperationException("File size is invalid");
+
+                    DebugLog($"GetLength = {realLength / Consts.PageSize}");
+                    
+                    _length = realLength;
                 }
-                return _Length.Value;
+
+                return _length.Value;
             }
-        }
-
-        public override long Position { get; set; }
-
-        object GetLock(long position)
-        {
-            return Locks[(position / PageSize) % NumberOfLocks];
-        }
-
-        object[] GetLocks(IEnumerable<long> ps)
-        {
-            return ps.Select(t => (t / PageSize) % NumberOfLocks).Distinct().Select(t => Locks[t]).ToArray();
         }
 
         public override int Read(byte[] buffer, int offset, int count)
         {
-            if (offset % PageSize != 0)
-                throw new NotImplementedException("invalid offset");
-            if (count != PageSize)
-                throw new NotImplementedException($"Read count is not {PageSize}; it is possible that you are not using LiteDB 5");
+            if (offset % Consts.PageSize != 0)
+                throw new InvalidOperationException($"Offset {offset} must be multiple of {Consts.PageSize}");
+
+            if (count != Consts.PageSize)
+                throw new InvalidOperationException($"Read count is not {Consts.PageSize}; it is possible that you are not using LiteDB 5");
 
             var position = Position;
 
             byte[] cached;
+
             lock (GetLock(position))
             {
-                if (!Cache.TryGetValue(position, out cached))
+                if (!_cache.TryGetValue(position, out cached))
                     cached = null;
                 else
                     Buffer.BlockCopy(cached, 0, buffer, offset, count);
+
                 Position += count;
             }
+
             if (cached == null)
             {
-                if (WriteDebugLogs)
-                    Console.WriteLine($"Read @{position / PageSize} #{count / PageSize}");
+                DebugLog($"Read @{position / Consts.PageSize} #{count / Consts.PageSize}");
                 ReadAhead(position, buffer, offset);
                 return count;
             }
@@ -146,117 +122,73 @@ namespace LiteDB.AzureBlob
             {
                 Task.Run(() =>
                 {
-                    for (var i = 1; i < Pages * 2; i++)
+                    for (var i = 1; i < Consts.Pages * 2; i++)
                     {
-                        var off = position + PageSize * i;
-                        if (Cache.ContainsKey(off) == false)
+                        var off = position + Consts.PageSize * i;
+                        if (_cache.ContainsKey(off) == false)
                         {
                             ReadAhead(off);
                             break;
                         }
                     }
                 });
+
                 return count;
             }
         }
 
-        void ReadAhead(long position, byte[] bufToReturn = null, int offset = 0)
-        {
-            var buf = Buffers.Take();
-
-            byte[] CachePage(int i)
-            {
-                var offsetBuf = i * PageSize;
-                var offsetStream = position + offsetBuf;
-                lock (GetLock(offsetStream))
-                {
-                    if (Cache.TryGetValue(offsetStream, out byte[] tmp))
-                        return tmp;
-
-                    tmp = new byte[PageSize];
-                    Buffer.BlockCopy(buf, offsetBuf, tmp, 0, PageSize);
-                    Cache[offsetStream] = tmp;
-                    return tmp;
-                }
-            }
-
-            if (bufToReturn != null)
-            {
-                var ret = Blob.DownloadRangeToByteArrayAsync(buf, 0, position, buf.Length).Result;
-                Debug.Assert(ret == buf.Length);
-                Buffer.BlockCopy(CachePage(0), 0, bufToReturn, offset, PageSize);
-
-                Task.Run(() =>
-                {
-                    for (var i = 1; i < Pages; i++)
-                        CachePage(i);
-                    Buffers.Add(buf);
-                });
-            }
-            else
-            {
-                Task.Run(() =>
-                {
-                    var ret = Blob.DownloadRangeToByteArrayAsync(buf, 0, position, buf.Length).Result;
-                    Debug.Assert(ret == buf.Length);
-                    for (var i = 0; i < Pages; i++)
-                        CachePage(i);
-                    Buffers.Add(buf);
-                });
-            }
-        }
-
-        public override long Seek(long offset, SeekOrigin origin)
-        {
-            throw new NotImplementedException();
-        }
-
         public override void SetLength(long value)
         {
-            Debug.Assert(value % PageSize == 0);
+            Debug.Assert(value % Consts.PageSize == 0);
             SetLengthInternal(value);
         }
 
         public override void Write(byte[] buffer, int offset, int count)
         {
             if (offset != 0)
-                throw new NotImplementedException("write offset is not 0; it is possible that your are not using LiteDB 5");
-            if (count != PageSize)
-                throw new NotImplementedException($"write count is not {PageSize}; it is possible that you are not using LiteDB 5");
+                throw new NotImplementedException("Write offset is not 0; it is possible that your are not using LiteDB 5");
+
+            if (count != Consts.PageSize)
+                throw new NotImplementedException($"Write count is not {Consts.PageSize}; it is possible that you are not using LiteDB 5");
 
             var position = Position;
+
             lock (GetLock(position))
             {
-                if (!Cache.TryGetValue(position, out byte[] cached))
-                    Cache.TryAdd(position, cached = new byte[PageSize]);
+                if (!_cache.TryGetValue(position, out byte[] cached))
+                    _cache.TryAdd(position, cached = new byte[Consts.PageSize]);
+
                 Buffer.BlockCopy(buffer, 0, cached, 0, count);
-                lock (Pending)
+
+                lock (_pendingWrites)
                 {
-                    Pending[position] = cached;
+                    _pendingWrites[position] = cached;
                 }
+
                 Position += count;
-                if (Position > LazyLength)
-                    LazyLength = Position;
+
+                if (Position > _lazyLength)
+                    _lazyLength = Position;
             }
         }
 
         public override void Flush()
         {
-            if (Pending.Count == 0)
+            if (_pendingWrites.Count == 0)
                 return;
 
-            if (WriteDebugLogs)
-                Console.WriteLine("Flush " + string.Join(",", Pending.Select(t => t.Key / PageSize)));
+            DebugLog("Flush " + string.Join(",", _pendingWrites.Select(t => t.Key / Consts.PageSize)));
 
             Queue<KeyValuePair<long, byte[]>> queue;
-            lock (Pending)
+            lock (_pendingWrites)
             {
-                queue = new Queue<KeyValuePair<long, byte[]>>(Pending.OrderByDescending(t => t.Key));
-                Pending.Clear();
+                queue = new Queue<KeyValuePair<long, byte[]>>(_pendingWrites.OrderByDescending(t => t.Key));
+                _pendingWrites.Clear();
             }
 
             var tasks = new List<Task>();
             var locks = GetLocks(queue.Select(t => t.Key));
+
             foreach (var m in locks)
                 Monitor.Enter(m);
 
@@ -265,10 +197,10 @@ namespace LiteDB.AzureBlob
                 while (true)
                 {
                     var batch = new Stack<KeyValuePair<long, byte[]>>();
-                    while (batch.Count < Pages && queue.Count > 0)
+                    while (batch.Count < Consts.Pages && queue.Count > 0)
                     {
                         var next = queue.Peek();
-                        if (batch.Count == 0 || batch.Peek().Key - PageSize == next.Key)
+                        if (batch.Count == 0 || batch.Peek().Key - Consts.PageSize == next.Key)
                         {
                             queue.Dequeue();
                             batch.Push(next);
@@ -276,27 +208,28 @@ namespace LiteDB.AzureBlob
                         else
                             break;
                     }
+
                     if (batch.Count == 0)
                         break;
                     else if (batch.Count == 1)
                     {
-                        var task = Task.Run(() =>
+                        var task = Task.Run(async () =>
                         {
                             var p = batch.Peek();
                             using (var ms = new MemoryStream(p.Value))
                             {
-                                if (WriteDebugLogs)
-                                    Console.WriteLine($"WriteOne @{p.Key / PageSize}");
-                                Blob.WritePagesAsync(ms, p.Key, null).Wait();
+                                DebugLog($"WriteOne @{p.Key / Consts.PageSize}");
+                                await _blog.WritePagesAsync(ms, p.Key, null);
                             }
                         });
+
                         tasks.Add(task);
                     }
                     else
                     {
-                        var task = Task.Run(() =>
+                        var task = Task.Run(async () =>
                         {
-                            var buf = Buffers.Take();
+                            var buf = _buffers.Take();
                             long offsetStart = 0;
                             int offsetWithinBuf = 0;
                             long offsetLast = -1;
@@ -310,26 +243,28 @@ namespace LiteDB.AzureBlob
                                 }
                                 else
                                 {
-                                    Debug.Assert(offsetLast + PageSize == p.Key);
+                                    Debug.Assert(offsetLast + Consts.PageSize == p.Key);
                                     offsetLast = p.Key;
                                 }
-                                Buffer.BlockCopy(p.Value, 0, buf, offsetWithinBuf, PageSize);
-                                offsetWithinBuf += PageSize;
+                                Buffer.BlockCopy(p.Value, 0, buf, offsetWithinBuf, Consts.PageSize);
+                                offsetWithinBuf += Consts.PageSize;
                             }
-                            if (WriteDebugLogs)
-                                Console.WriteLine($"WriteBatch @{offsetStart / PageSize} #{cnt}");
+                            
+                            DebugLog($"WriteBatch @{offsetStart / Consts.PageSize} #{cnt}");
+                            
                             using (var ms = new MemoryStream(buf, 0, offsetWithinBuf))
                             {
-                                Blob.WritePagesAsync(ms, offsetStart, null).Wait();
+                                await _blog.WritePagesAsync(ms, offsetStart, null);
                             }
-                            Buffers.Add(buf);
+                            _buffers.Add(buf);
                         });
+
                         tasks.Add(task);
                     }
                 }
 
-                SetLengthInternal(LazyLength);
-                Task.WaitAll(tasks.ToArray());
+                SetLengthInternal(_lazyLength);
+                Task.WhenAll(tasks.ToArray()).SyncWait();
             }
             finally
             {
@@ -338,41 +273,91 @@ namespace LiteDB.AzureBlob
             }
         }
 
-        public static void DropDatabase(string connString, string name)
-        {
-            Console.WriteLine("Deleting " + name);
-            var blob = GetBlobReference(connString, name);
-            blob.DeleteIfExistsAsync().Wait();
-        }
+        public override long Seek(long offset, SeekOrigin origin)
+            => throw new NotImplementedException();
 
-        public static void Download(string connString, string dbName, string localFile)
+        private void ReadAhead(long position, byte[] bufferToReturn = null, int offset = 0)
         {
-            Console.WriteLine($"Download {dbName} to {localFile}");
-            using (var s = File.OpenWrite(localFile))
-            using (var page = new AzurePageBlobStream(connString, dbName))
-            {
-                page.Blob.DownloadRangeToStreamAsync(s, 0, page.Length).Wait();
-            }
-        }
+            var buffer = _buffers.Take();
 
-        /*
-        public static void Upload(string localFile, string connString, string dbName)
-        {
-            Console.WriteLine("Upload " + localFile);
-            using (var r = File.OpenRead(localFile))
+            byte[] CachePage(int i)
             {
-                Debug.Assert(r.Length % PageSize == 0);
-                Console.WriteLine(r.Length);
-                var buf = new byte[1024 * 1024];
-                using (var stream = new AzurePageBlobStream(connString, dbName))
+                var offsetBuf = i * Consts.PageSize;
+                var offsetStream = position + offsetBuf;
+                lock (GetLock(offsetStream))
                 {
-                    int cnt;
-                    while ((cnt = r.Read(buf, 0, buf.Length)) > 0)
-                        stream.Write(buf, 0, cnt);
-                    stream.SetLengthInternal(r.Length);
+                    if (_cache.TryGetValue(offsetStream, out byte[] tmp))
+                        return tmp;
+
+                    tmp = new byte[Consts.PageSize];
+                    Buffer.BlockCopy(buffer, offsetBuf, tmp, 0, Consts.PageSize);
+                    _cache[offsetStream] = tmp;
+                    return tmp;
                 }
             }
+
+            if (bufferToReturn != null)
+            {
+                var downloadResult = _blog.DownloadRangeToByteArrayAsync(buffer, 0, position, buffer.Length).SyncResult();
+                Debug.Assert(downloadResult == buffer.Length);
+                Buffer.BlockCopy(CachePage(0), 0, bufferToReturn, offset, Consts.PageSize);
+
+                Task.Run(() =>
+                {
+                    for (var i = 1; i < Consts.Pages; i++)
+                        CachePage(i);
+
+                    _buffers.Add(buffer);
+                });
+            }
+            else
+            {
+                Task.Run(() =>
+                {
+                    var ret = _blog.DownloadRangeToByteArrayAsync(buffer, 0, position, buffer.Length).SyncResult();
+                    Debug.Assert(ret == buffer.Length);
+                    for (var i = 0; i < Consts.Pages; i++)
+                        CachePage(i);
+                    _buffers.Add(buffer);
+                });
+            }
         }
-        */
+
+        public static void DropDatabase(string connString, string name)
+        {
+            DebugLog("Deleting " + name);
+            var blob = GetBlobReference(connString, name);
+            blob.DeleteIfExistsAsync().SyncWait();
+        }
+
+        private void SetLengthInternal(long newLength)
+        {
+            _length = newLength;
+            DebugLog($"SetLength = {newLength / Consts.PageSize}");
+            _blog.Metadata[Consts.MetadataLengthKey] = newLength.ToString();
+            _blog.SetMetadataAsync().SyncWait();
+        }
+
+        private object GetLock(long position)
+            => _locks[(position / Consts.PageSize) % Consts.NumberOfLocks];
+
+        private object[] GetLocks(IEnumerable<long> ps)
+            => ps.Select(t => (t / Consts.PageSize) % Consts.NumberOfLocks).Distinct().Select(t => _locks[t]).ToArray();
+
+        private static CloudPageBlob GetBlobReference(string connString, string databaseName)
+        {
+            CloudStorageAccount.TryParse(connString, out var account);
+            var client = account.CreateCloudBlobClient();
+
+            var container = client.GetContainerReference(Consts.DefaultContainerName);
+            container.CreateIfNotExistsAsync().SyncWait();
+
+            var blob = container.GetPageBlobReference(databaseName);
+            return blob;
+        }
+
+        [Conditional("DEBUG")]
+        private static void DebugLog(string message)
+            => Console.WriteLine(message);
     }
 }
