@@ -22,7 +22,6 @@ namespace Demo
             var databaseName = "db1";
 
             // write
-            AzureBlockBlobStream.WriteDebugLogs = true;
             using (var stream = new AzureBlockBlobStream(connectionString, databaseName))
                 TestWriteDatabase(stream);
 
@@ -44,7 +43,6 @@ namespace Demo
             var databaseName = "db1";
 
             // write
-            AzurePageBlobStream.WriteDebugLogs = true;
             using (var stream = new AzurePageBlobStream(connectionString, databaseName))
                 TestWriteDatabase(stream);
 
